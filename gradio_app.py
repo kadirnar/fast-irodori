@@ -378,7 +378,7 @@ def build_ui() -> gr.Blocks:
             with gr.Column(scale=1):
                 normalize_ref_audio = gr.Checkbox(
                     label="Normalize Ref Audio (-16 LUFS + ensure max)",
-                    value=False,
+                    value=True,
                 )
 
         with gr.Accordion("Sampling", open=True):
