@@ -10,8 +10,8 @@ import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from .codec import patchify_latent
-from .tokenizer import PretrainedTextTokenizer
+from irodori_tts.audio.codec import patchify_latent
+from irodori_tts.text.tokenizer import PretrainedTextTokenizer
 
 
 def _coerce_latent_shape(latent: torch.Tensor, latent_dim: int) -> torch.Tensor:

@@ -15,13 +15,13 @@ import torchaudio
 from safetensors import safe_open
 from safetensors.torch import load_file as load_safetensors_file
 
-from .codec import DACVAECodec, patchify_latent, unpatchify_latent
-from .config import ModelConfig
-from .lora import checkpoint_state_uses_lora
-from .model import TextToLatentRFDiT
-from .rf import sample_euler_rf_cfg
-from .text_normalization import normalize_text
-from .tokenizer import PretrainedTextTokenizer
+from irodori_tts.audio.codec import DACVAECodec, patchify_latent, unpatchify_latent
+from irodori_tts.config import ModelConfig
+from irodori_tts.model.dit import TextToLatentRFDiT
+from irodori_tts.model.lora import checkpoint_state_uses_lora
+from irodori_tts.model.rf import sample_euler_rf_cfg
+from irodori_tts.text.normalization import normalize_text
+from irodori_tts.text.tokenizer import PretrainedTextTokenizer
 
 
 def _is_mps_available() -> bool:

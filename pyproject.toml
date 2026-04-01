@@ -1,3 +1,7 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "irodori-tts"
 version = "0.1.0"
@@ -24,6 +28,14 @@ dependencies = [
     "tqdm>=4.67.3",
     "wandb>=0.17.0",
 ]
+
+[project.scripts]
+irodori-train = "irodori_tts.training.train:main"
+irodori-infer = "irodori_tts.inference.infer:main"
+irodori-app = "irodori_tts.app.gradio_app:main"
+irodori-app-voicedesign = "irodori_tts.app.gradio_app_voicedesign:main"
+irodori-prepare-manifest = "irodori_tts.tools.prepare_manifest:main"
+irodori-convert-checkpoint = "irodori_tts.tools.convert_checkpoint_to_safetensors:main"
 
 [project.optional-dependencies]
 dev = [

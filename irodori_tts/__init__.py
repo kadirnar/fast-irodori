@@ -1,9 +1,9 @@
 """Irodori-TTS package: text-conditioned RF diffusion over DACVAE latents."""
 
-from .config import ModelConfig, SamplingConfig, TrainConfig
-from .lora import LORA_TARGET_PRESETS
-from .model import TextToLatentRFDiT
-from .tokenizer import ByteTokenizer, PretrainedTextTokenizer
+from irodori_tts.config import ModelConfig, SamplingConfig, TrainConfig
+from irodori_tts.model.dit import TextToLatentRFDiT
+from irodori_tts.model.lora import LORA_TARGET_PRESETS
+from irodori_tts.text.tokenizer import ByteTokenizer, PretrainedTextTokenizer
 
 __all__ = [
     "ByteTokenizer",

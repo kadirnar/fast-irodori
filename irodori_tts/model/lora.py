@@ -6,8 +6,8 @@ from typing import Any
 
 import torch
 
-from .config import TrainConfig
-from .model import TextToLatentRFDiT
+from irodori_tts.config import TrainConfig
+from irodori_tts.model.dit import TextToLatentRFDiT
 
 LORA_TRAIN_CONFIG_FIELDS = (
     "lora_enabled",

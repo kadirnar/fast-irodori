@@ -4,7 +4,7 @@ import math
 
 import torch
 
-from .config import TrainConfig
+from irodori_tts.config import TrainConfig
 
 
 class MuonWithAuxAdamW:

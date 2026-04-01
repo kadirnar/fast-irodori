@@ -24,8 +24,8 @@ from irodori_tts.config import (
     load_experiment_yaml,
     merge_dataclass_overrides,
 )
-from irodori_tts.dataset import LatentTextDataset, TTSCollator
-from irodori_tts.lora import (
+from irodori_tts.model.dit import TextToLatentRFDiT
+from irodori_tts.model.lora import (
     LORA_METADATA_NAME,
     LORA_TARGET_PRESETS,
     LORA_TRAIN_CONFIG_FIELDS,
@@ -36,16 +36,16 @@ from irodori_tts.lora import (
     load_lora_adapter,
     train_config_uses_lora,
 )
-from irodori_tts.model import TextToLatentRFDiT
-from irodori_tts.optim import build_optimizer, build_scheduler, current_lr
-from irodori_tts.progress import TrainProgress
-from irodori_tts.rf import (
+from irodori_tts.model.rf import (
     rf_interpolate,
     rf_velocity_target,
     sample_logit_normal_t,
     sample_stratified_logit_normal_t,
 )
-from irodori_tts.tokenizer import PretrainedTextTokenizer
+from irodori_tts.text.tokenizer import PretrainedTextTokenizer
+from irodori_tts.training.dataset import LatentTextDataset, TTSCollator
+from irodori_tts.training.optim import build_optimizer, build_scheduler, current_lr
+from irodori_tts.training.progress import TrainProgress
 
 WANDB_MODES = {"online", "offline", "disabled"}
 CHECKPOINT_STEP_RE = re.compile(r"^checkpoint_(\d+)(?:\.pt)?$")

@@ -8,7 +8,7 @@ from pathlib import Path
 import gradio as gr
 from huggingface_hub import hf_hub_download
 
-from irodori_tts.inference_runtime import (
+from irodori_tts.inference.runtime import (
     RuntimeKey,
     SamplingRequest,
     clear_cached_runtime,
@@ -31,16 +31,9 @@ def _default_checkpoint() -> str:
             *Path(".").glob("**/checkpoint_*.safetensors"),
         ]
     )
-    preferred = [
-        path
-        for path in candidates
-        if "caption" in str(path).lower() or "voice_design" in str(path).lower()
-    ]
-    if preferred:
-        return str(preferred[-1])
-    if candidates:
-        return str(candidates[-1])
-    return "Aratako/Irodori-TTS-500M-v2-VoiceDesign"
+    if not candidates:
+        return "Aratako/Irodori-TTS-500M-v2"
+    return str(candidates[-1])
 
 
 def _default_model_device() -> str:
@@ -98,6 +91,12 @@ def _format_timings(stage_timings: list[tuple[str, float]], total_to_decode: flo
     return "\n".join(lines)
 
 
+def _resolve_ref_wav(uploaded_audio: str | None) -> str | None:
+    if uploaded_audio is not None and str(uploaded_audio).strip() != "":
+        return str(uploaded_audio)
+    return None
+
+
 def _resolve_checkpoint_path(raw_checkpoint: str) -> str:
     checkpoint = str(raw_checkpoint).strip()
     if checkpoint == "":
@@ -108,7 +107,7 @@ def _resolve_checkpoint_path(raw_checkpoint: str) -> str:
         return checkpoint
 
     resolved = hf_hub_download(repo_id=checkpoint, filename="model.safetensors")
-    print(f"[gradio-caption] checkpoint: hf://{checkpoint} -> {resolved}", flush=True)
+    print(f"[gradio] checkpoint: hf://{checkpoint} -> {resolved}", flush=True)
     return str(resolved)
 
 
@@ -134,7 +133,7 @@ def _build_runtime_key(
     )
 
 
-def _describe_runtime(
+def _load_model(
     checkpoint: str,
     model_device: str,
     model_precision: str,
@@ -150,31 +149,18 @@ def _describe_runtime(
         codec_precision=codec_precision,
         enable_watermark=enable_watermark,
     )
-    runtime, reloaded = get_cached_runtime(runtime_key)
-    status = (
-        "loaded model into memory" if reloaded else "model already loaded; reused existing runtime"
-    )
-    notes: list[str] = []
-    if not runtime.model_cfg.use_caption_condition:
-        notes.append(
-            "warning: this checkpoint does not enable caption conditioning. Use gradio_app.py for reference-audio inference."
-        )
-    if runtime.model_cfg.use_speaker_condition:
-        notes.append(
-            "info: this checkpoint still supports speaker conditioning, but this UI always runs without reference audio."
-        )
-    return "\n".join(
-        [
-            status,
-            f"checkpoint: {runtime_key.checkpoint}",
-            f"model_device: {runtime_key.model_device}",
-            f"model_precision: {runtime_key.model_precision}",
-            f"codec_device: {runtime_key.codec_device}",
-            f"codec_precision: {runtime_key.codec_precision}",
-            f"use_caption_condition: {runtime.model_cfg.use_caption_condition}",
-            f"use_speaker_condition: {runtime.model_cfg.use_speaker_condition}",
-            *notes,
-        ]
+    _, reloaded = get_cached_runtime(runtime_key)
+    if reloaded:
+        status = "loaded model into memory"
+    else:
+        status = "model already loaded; reused existing runtime"
+    return (
+        f"{status}\n"
+        f"checkpoint: {runtime_key.checkpoint}\n"
+        f"model_device: {runtime_key.model_device}\n"
+        f"model_precision: {runtime_key.model_precision}\n"
+        f"codec_device: {runtime_key.codec_device}\n"
+        f"codec_precision: {runtime_key.codec_precision}"
     )
 
 
@@ -186,22 +172,23 @@ def _run_generation(
     codec_precision: str,
     enable_watermark: bool,
     text: str,
-    caption: str,
+    uploaded_audio: str | None,
     num_steps: int,
     num_candidates: int,
     seed_raw: str,
     cfg_guidance_mode: str,
     cfg_scale_text: float,
-    cfg_scale_caption: float,
+    cfg_scale_speaker: float,
     cfg_scale_raw: str,
     cfg_min_t: float,
     cfg_max_t: float,
     context_kv_cache: bool,
-    max_text_len_raw: str,
-    max_caption_len_raw: str,
     truncation_factor_raw: str,
     rescale_k_raw: str,
     rescale_sigma_raw: str,
+    speaker_kv_scale_raw: str,
+    speaker_kv_min_t_raw: str,
+    speaker_kv_max_layers_raw: str,
 ) -> tuple[object, ...]:
     def stdout_log(msg: str) -> None:
         print(msg, flush=True)
@@ -215,12 +202,8 @@ def _run_generation(
         enable_watermark=enable_watermark,
     )
 
-    text_value = str(text).strip()
-    caption_value = str(caption).strip()
-
-    if text_value == "":
+    if str(text).strip() == "":
         raise ValueError("text is required.")
-
     requested_candidates = int(num_candidates)
     if requested_candidates <= 0:
         raise ValueError("num_candidates must be >= 1.")
@@ -228,24 +211,25 @@ def _run_generation(
         raise ValueError(f"num_candidates must be <= {MAX_GRADIO_CANDIDATES}.")
 
     cfg_scale = _parse_optional_float(cfg_scale_raw, "cfg_scale")
-    max_text_len = _parse_optional_int(max_text_len_raw, "max_text_len")
-    max_caption_len = _parse_optional_int(max_caption_len_raw, "max_caption_len")
     truncation_factor = _parse_optional_float(truncation_factor_raw, "truncation_factor")
     rescale_k = _parse_optional_float(rescale_k_raw, "rescale_k")
     rescale_sigma = _parse_optional_float(rescale_sigma_raw, "rescale_sigma")
+    speaker_kv_scale = _parse_optional_float(speaker_kv_scale_raw, "speaker_kv_scale")
+    speaker_kv_min_t = _parse_optional_float(speaker_kv_min_t_raw, "speaker_kv_min_t")
+    speaker_kv_max_layers = _parse_optional_int(speaker_kv_max_layers_raw, "speaker_kv_max_layers")
     seed = _parse_optional_int(seed_raw, "seed")
 
-    runtime, reloaded = get_cached_runtime(runtime_key)
-    if not runtime.model_cfg.use_caption_condition:
-        raise ValueError(
-            "Loaded checkpoint does not enable caption conditioning. Use gradio_app.py for the original reference-audio model."
-        )
+    ref_wav = _resolve_ref_wav(uploaded_audio=uploaded_audio)
+    no_ref = ref_wav is None
+    ref_normalize_db = -16.0
+    ref_ensure_max = True
 
-    stdout_log(f"[gradio-caption] runtime: {'reloaded' if reloaded else 'reused'}")
+    runtime, reloaded = get_cached_runtime(runtime_key)
+    stdout_log(f"[gradio] runtime: {'reloaded' if reloaded else 'reused'}")
     stdout_log(
         (
-            "[gradio-caption] request: model_device={} model_precision={} codec_device={} codec_precision={} "
-            "watermark={} mode={} seconds={} steps={} seed={} candidates={}"
+            "[gradio] request: model_device={} model_precision={} codec_device={} codec_precision={} "
+            "watermark={} mode={} seconds={} steps={} seed={} no_ref={} candidates={}"
         ).format(
             model_device,
             model_precision,
@@ -256,37 +240,29 @@ def _run_generation(
             FIXED_SECONDS,
             num_steps,
             "random" if seed is None else seed,
+            no_ref,
             requested_candidates,
-        )
-    )
-    stdout_log(
-        "[gradio-caption] conditioning: text={} caption={}".format(
-            "on" if text_value else "off",
-            "on" if caption_value else "off (text-only)",
         )
     )
 
     result = runtime.synthesize(
         SamplingRequest(
-            text=text_value,
-            caption=caption_value or None,
-            ref_wav=None,
+            text=str(text),
+            ref_wav=ref_wav,
             ref_latent=None,
-            no_ref=True,
-            ref_normalize_db=-16.0,
-            ref_ensure_max=True,
+            no_ref=bool(no_ref),
+            ref_normalize_db=ref_normalize_db,
+            ref_ensure_max=bool(ref_ensure_max),
             num_candidates=requested_candidates,
             decode_mode="sequential",
             seconds=FIXED_SECONDS,
             max_ref_seconds=30.0,
-            max_text_len=max_text_len,
-            max_caption_len=max_caption_len,
+            max_text_len=None,
             num_steps=int(num_steps),
             seed=None if seed is None else int(seed),
             cfg_guidance_mode=str(cfg_guidance_mode),
             cfg_scale_text=float(cfg_scale_text),
-            cfg_scale_caption=float(cfg_scale_caption),
-            cfg_scale_speaker=0.0,
+            cfg_scale_speaker=float(cfg_scale_speaker),
             cfg_scale=cfg_scale,
             cfg_min_t=float(cfg_min_t),
             cfg_max_t=float(cfg_max_t),
@@ -294,15 +270,15 @@ def _run_generation(
             rescale_k=rescale_k,
             rescale_sigma=rescale_sigma,
             context_kv_cache=bool(context_kv_cache),
-            speaker_kv_scale=None,
-            speaker_kv_min_t=None,
-            speaker_kv_max_layers=None,
+            speaker_kv_scale=speaker_kv_scale,
+            speaker_kv_min_t=speaker_kv_min_t,
+            speaker_kv_max_layers=speaker_kv_max_layers,
             trim_tail=True,
         ),
         log_fn=stdout_log,
     )
 
-    out_dir = Path("gradio_outputs_voicedesign")
+    out_dir = Path("gradio_outputs")
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     out_paths: list[str] = []
@@ -322,13 +298,9 @@ def _run_generation(
         *[f"saved[{i}]: {path}" for i, path in enumerate(out_paths, start=1)],
         *result.messages,
     ]
-    if runtime.model_cfg.use_speaker_condition:
-        detail_lines.append(
-            "info: speaker conditioning exists in this checkpoint, but this UI forced no-reference mode."
-        )
     detail_text = "\n".join(detail_lines)
     timing_text = _format_timings(result.stage_timings, result.total_to_decode)
-    stdout_log(f"[gradio-caption] saved {len(out_paths)} candidates")
+    stdout_log(f"[gradio] saved {len(out_paths)} candidates")
 
     audio_updates: list[object] = []
     for i in range(MAX_GRADIO_CANDIDATES):
@@ -352,10 +324,10 @@ def build_ui() -> gr.Blocks:
     model_precision_choices = _precision_choices_for_device(default_model_device)
     codec_precision_choices = _precision_choices_for_device(default_codec_device)
 
-    with gr.Blocks(title="Irodori-TTS VoiceDesign Gradio") as demo:
-        gr.Markdown("# Irodori-TTS VoiceDesign Inference")
+    with gr.Blocks(title="Irodori-TTS Gradio") as demo:
+        gr.Markdown("# Irodori-TTS Inference (Cached Runtime)")
         gr.Markdown(
-            "VoiceDesign版モデル向けのUIです。caption を入れると caption / style conditioning、空欄なら text-only conditioning で推論します。"
+            "When settings are unchanged, runtime is reused and only sampling/decoding runs."
         )
 
         with gr.Row():
@@ -396,9 +368,9 @@ def build_ui() -> gr.Blocks:
             clear_cache_msg = gr.Textbox(label="Model Status", interactive=False)
 
         text = gr.Textbox(label="Text", lines=4)
-        caption = gr.Textbox(
-            label="Caption / Style Prompt (optional)",
-            lines=4,
+        uploaded_audio = gr.Audio(
+            label="Reference Audio Upload (optional, blank = no-reference mode)",
+            type="filepath",
         )
 
         with gr.Accordion("Sampling", open=True):
@@ -423,14 +395,14 @@ def build_ui() -> gr.Blocks:
                     label="CFG Scale Text",
                     minimum=0.0,
                     maximum=10.0,
-                    value=2.0,
+                    value=3.0,
                     step=0.1,
                 )
-                cfg_scale_caption = gr.Slider(
-                    label="CFG Scale Caption",
+                cfg_scale_speaker = gr.Slider(
+                    label="CFG Scale Speaker",
                     minimum=0.0,
                     maximum=10.0,
-                    value=4.0,
+                    value=5.0,
                     step=0.1,
                 )
 
@@ -441,12 +413,15 @@ def build_ui() -> gr.Blocks:
                 cfg_max_t = gr.Number(label="CFG Max t", value=1.0)
                 context_kv_cache = gr.Checkbox(label="Context KV Cache", value=True)
             with gr.Row():
-                max_text_len_raw = gr.Textbox(label="Max Text Len (optional)", value="")
-                max_caption_len_raw = gr.Textbox(label="Max Caption Len (optional)", value="")
-            with gr.Row():
                 truncation_factor_raw = gr.Textbox(label="Truncation Factor (optional)", value="")
                 rescale_k_raw = gr.Textbox(label="Rescale k (optional)", value="")
                 rescale_sigma_raw = gr.Textbox(label="Rescale sigma (optional)", value="")
+            with gr.Row():
+                speaker_kv_scale_raw = gr.Textbox(label="Speaker KV Scale (optional)", value="")
+                speaker_kv_min_t_raw = gr.Textbox(label="Speaker KV Min t (optional)", value="0.9")
+                speaker_kv_max_layers_raw = gr.Textbox(
+                    label="Speaker KV Max Layers (optional)", value=""
+                )
 
         generate_btn = gr.Button("Generate", variant="primary")
 
@@ -483,22 +458,23 @@ def build_ui() -> gr.Blocks:
                 codec_precision,
                 enable_watermark,
                 text,
-                caption,
+                uploaded_audio,
                 num_steps,
                 num_candidates,
                 seed_raw,
                 cfg_guidance_mode,
                 cfg_scale_text,
-                cfg_scale_caption,
+                cfg_scale_speaker,
                 cfg_scale_raw,
                 cfg_min_t,
                 cfg_max_t,
                 context_kv_cache,
-                max_text_len_raw,
-                max_caption_len_raw,
                 truncation_factor_raw,
                 rescale_k_raw,
                 rescale_sigma_raw,
+                speaker_kv_scale_raw,
+                speaker_kv_min_t_raw,
+                speaker_kv_max_layers_raw,
             ],
             outputs=[*out_audios, out_log, out_timing],
         )
@@ -510,7 +486,7 @@ def build_ui() -> gr.Blocks:
         )
 
         load_model_btn.click(
-            _describe_runtime,
+            _load_model,
             inputs=[
                 checkpoint,
                 model_device,
@@ -527,11 +503,9 @@ def build_ui() -> gr.Blocks:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Gradio app for caption-conditioned Irodori-TTS checkpoints."
-    )
+    parser = argparse.ArgumentParser(description="Gradio app for Irodori-TTS with cached runtime.")
     parser.add_argument("--server-name", default="127.0.0.1")
-    parser.add_argument("--server-port", type=int, default=7861)
+    parser.add_argument("--server-port", type=int, default=7860)
     parser.add_argument("--share", action="store_true")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from .model import TextToLatentRFDiT
+from irodori_tts.model.dit import TextToLatentRFDiT
 
 
 def _make_rng(seed: int, device: torch.device) -> tuple[torch.Generator, torch.device]:

@@ -7,7 +7,7 @@ from pathlib import Path
 
 from huggingface_hub import hf_hub_download
 
-from irodori_tts.inference_runtime import (
+from irodori_tts.inference.runtime import (
     InferenceRuntime,
     RuntimeKey,
     SamplingRequest,

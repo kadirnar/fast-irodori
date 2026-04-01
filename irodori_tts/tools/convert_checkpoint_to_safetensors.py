@@ -12,15 +12,15 @@ import torch
 from safetensors.torch import save_file
 
 from irodori_tts.config import ModelConfig, merge_dataclass_overrides
-from irodori_tts.inference_runtime import _load_checkpoint_for_inference
-from irodori_tts.lora import (
+from irodori_tts.inference.runtime import _load_checkpoint_for_inference
+from irodori_tts.model.dit import TextToLatentRFDiT
+from irodori_tts.model.lora import (
     LORA_METADATA_NAME,
     LORA_TRAINER_STATE_NAME,
     checkpoint_state_uses_lora,
     is_lora_adapter_dir,
     load_lora_adapter,
 )
-from irodori_tts.model import TextToLatentRFDiT
 
 CONFIG_META_KEY = "config_json"
 INFERENCE_CONFIG_KEYS = ("max_text_len", "max_caption_len", "fixed_target_latent_steps")

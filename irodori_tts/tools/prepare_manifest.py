@@ -20,8 +20,8 @@ import torch.multiprocessing as mp
 from datasets import Audio, load_dataset
 from tqdm import tqdm
 
-from irodori_tts.codec import DACVAECodec
-from irodori_tts.text_normalization import normalize_text
+from irodori_tts.audio.codec import DACVAECodec
+from irodori_tts.text.normalization import normalize_text
 
 
 def _coerce_text(value: Any) -> str:
@@ -29,7 +29,7 @@ def _coerce_text(value: Any) -> str:
         return ""
     if isinstance(value, str):
         return value
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return " ".join(str(x) for x in value)
     return str(value)
 
