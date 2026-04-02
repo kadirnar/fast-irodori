@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,6 +33,42 @@ def unpatchify_latent(patched: torch.Tensor, patch_size: int, latent_dim: int) -
     return patched.reshape(patched.shape[0], patched.shape[1] * patch_size, latent_dim)
 
 
+def _infer_dacvae_params(state_dict: dict[str, torch.Tensor]) -> dict:
+    """Infer DACVAE constructor params from checkpoint weight shapes."""
+    encoder_rates: list[int] = []
+    for i in range(1, 20):
+        key = f"encoder.block.{i}.block.4.weight_v"
+        if key not in state_dict:
+            break
+        kernel_size = state_dict[key].shape[2]
+        encoder_rates.append(kernel_size // 2)
+
+    codebook_dim = 8
+    in_proj_key = "quantizer.in_proj.weight_v"
+    if in_proj_key in state_dict:
+        codebook_dim = state_dict[in_proj_key].shape[0] // 2
+
+    decoder_rates = list(reversed(encoder_rates))
+    return {
+        "encoder_rates": encoder_rates,
+        "decoder_rates": decoder_rates,
+        "codebook_dim": codebook_dim,
+    }
+
+
+def _load_dacvae(path: str) -> torch.nn.Module:
+    """Load DACVAE with architecture inferred from checkpoint weights."""
+    from dacvae import DACVAE
+
+    state_dict = torch.load(path, map_location="cpu", weights_only=True)
+    if "state_dict" in state_dict:
+        state_dict = state_dict["state_dict"]
+    params = _infer_dacvae_params(state_dict)
+    model = DACVAE(**params)
+    model.load_state_dict(state_dict, strict=False)
+    return model
+
+
 @dataclass
 class DACVAECodec:
     model: torch.nn.Module
@@ -46,6 +81,7 @@ class DACVAECodec:
     deterministic_encode: bool
     deterministic_decode: bool
     normalize_db: float | None
+    optimized: bool = False
 
     @classmethod
     def load(
@@ -58,16 +94,8 @@ class DACVAECodec:
         deterministic_encode: bool = True,
         deterministic_decode: bool = True,
         normalize_db: float | None = -16.0,
+        optimize: bool = False,
     ) -> DACVAECodec:
-        # Prefer installed package; fallback to local clone at ../dacvae.
-        try:
-            from dacvae import DACVAE
-        except ImportError:
-            local_repo = Path(__file__).resolve().parents[2] / "dacvae"
-            if local_repo.exists():
-                sys.path.insert(0, str(local_repo))
-            from dacvae import DACVAE
-
         location = str(repo_id).strip()
         if location.startswith("hf://"):
             location = location[len("hf://") :]
@@ -76,10 +104,9 @@ class DACVAECodec:
                 location = hf_hub_download(repo_id=location, filename="weights.pth")
                 print(f"[codec] dacvae: hf://{repo_id} -> {location}", flush=True)
             except Exception:
-                # Let DACVAE.load surface a clearer error if this is not a valid path/repo.
                 pass
 
-        model = DACVAE.load(location).eval().to(device)
+        model = _load_dacvae(location).eval().to(device)
         if dtype is not None:
             model = model.to(dtype=dtype)
 
@@ -117,6 +144,11 @@ class DACVAECodec:
         dummy = torch.zeros(1, 1, 2048, device=device, dtype=model_dtype)
         with torch.inference_mode():
             z = model.encode(dummy)  # (B, D, T)
+
+        did_optimize = False
+        if optimize and torch.device(device).type == "cuda":
+            did_optimize = cls._apply_optimization(model)
+
         return cls(
             model=model,
             sample_rate=int(model.sample_rate),
@@ -128,6 +160,7 @@ class DACVAECodec:
             deterministic_encode=bool(deterministic_encode),
             deterministic_decode=bool(deterministic_decode),
             normalize_db=None if normalize_db is None else float(normalize_db),
+            optimized=did_optimize,
         )
 
     @staticmethod
@@ -144,6 +177,93 @@ class DACVAECodec:
             return torch.zeros((batch_size, nbits), dtype=torch.float32, device=message_device)
 
         wm_model.random_message = _fixed_message
+
+    @staticmethod
+    def _apply_optimization(model: torch.nn.Module) -> bool:
+        try:
+            from dacvae.optimize import (
+                _convert_conv1d_to_conv2d,
+                _fix_decoder_blocks,
+                _fix_profile_shadow,
+                _strip_weight_norm,
+            )
+        except ImportError:
+            print("[codec] fast-dacvae optimize not available, skipping", flush=True)
+            return False
+
+        import torch.nn as nn
+
+        _fix_profile_shadow()
+        torch.backends.cudnn.benchmark = True
+
+        # --- structural optimizations (all in-place) ---
+        _fix_decoder_blocks(model)
+        _strip_weight_norm(model)
+        _convert_conv1d_to_conv2d(model)  # conv1d→conv2d + polynomial Snake
+
+        for _, mod in model.named_modules():
+            if type(mod).__name__ == "ResidualUnit" and not mod.true_skip:
+                mod.shortcut = lambda x, y: x  # noqa: E731
+
+        # --- 4D-aware module runner (matches optimize_dacvae._run_module) ---
+        def _run(mod: nn.Module, x: torch.Tensor) -> torch.Tensor:
+            ctype = type(mod).__name__
+            if ctype == "ResidualUnit":
+                y = x
+                for sub in mod.block:
+                    y = _run(sub, y)
+                return y + mod.shortcut(x, y)
+            if isinstance(mod, nn.Sequential):
+                for sub in mod:
+                    x = _run(sub, x)
+                return x
+            if isinstance(mod, nn.Tanh):
+                return torch.tanh(x)
+            if isinstance(mod, nn.Identity):
+                return x
+            return mod(x)
+
+        # --- optimized encode (deterministic, returns mean) ---
+        def _encode_optimized(audio_data: torch.Tensor) -> torch.Tensor:
+            x = model._pad(audio_data)
+            x = x.unsqueeze(2).to(memory_format=torch.channels_last)
+            for layer in model.encoder.block:
+                x = _run(layer, x)
+            combined = model.quantizer.in_proj(x)
+            mean, _scale = combined.chunk(2, dim=1)
+            return mean.squeeze(2)
+
+        model.encode = _encode_optimized
+
+        # --- optimized decode (with mono projection, no watermark) ---
+        _wm_snake = None
+        _wm_conv = None
+        decoder = getattr(model, "decoder", None)
+        if decoder is not None and hasattr(decoder, "wm_model"):
+            wm_pre = decoder.wm_model.encoder_block.pre
+            if len(wm_pre) >= 2:
+                _wm_snake = wm_pre[0]
+                _wm_conv = wm_pre[1]
+
+        def _decode_optimized(z: torch.Tensor, message: torch.Tensor | None = None) -> torch.Tensor:
+            emb = z.unsqueeze(2).to(memory_format=torch.channels_last)
+            emb = model.quantizer.out_proj(emb)
+            for layer in model.decoder.model:
+                emb = _run(layer, emb)
+            if _wm_conv is not None:
+                emb = _wm_snake(emb)
+                emb = _wm_conv(emb)
+                emb = torch.tanh(emb)
+            return emb.squeeze(2)
+
+        model.decode = torch.compile(_decode_optimized)
+
+        print(
+            "[codec] dacvae fully optimized "
+            "(conv2d + poly snake + weight-norm strip + compile)",
+            flush=True,
+        )
+        return True
 
     @staticmethod
     def _normalize_loudness(
@@ -251,7 +371,10 @@ class DACVAECodec:
             waveform = torch.stack(processed, dim=0).unsqueeze(1)
 
         waveform = waveform.to(self.device, dtype=self.dtype)
-        if self.deterministic_encode:
+        if self.optimized:
+            # Optimized encode handles padding, 4D conversion, deterministic mean extraction.
+            encoded = self.model.encode(waveform)
+        elif self.deterministic_encode:
             required_paths_present = (
                 hasattr(self.model, "encoder")
                 and hasattr(self.model, "_pad")

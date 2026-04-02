@@ -743,31 +743,126 @@ class TextToLatentRFDiT(nn.Module):
         caption_mask: torch.Tensor | None = None,
         latent_mask: torch.Tensor | None = None,
         context_kv_cache: list[tuple[torch.Tensor, ...]] | None = None,
+        cache_state: object | None = None,
+        precomputed_cond_embed: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        t_embed = get_timestep_embedding(t, self.cfg.timestep_embed_dim).to(dtype=x_t.dtype)
-        cond_embed = self.cond_module(t_embed)
-        cond_embed = cond_embed[:, None, :]
+        if precomputed_cond_embed is not None:
+            cond_embed = precomputed_cond_embed
+        else:
+            t_embed = get_timestep_embedding(t, self.cfg.timestep_embed_dim).to(dtype=x_t.dtype)
+            cond_embed = self.cond_module(t_embed)
+            cond_embed = cond_embed[:, None, :]
 
         x = self.in_proj(x_t)
         freqs = self._rope_freqs(x.shape[1], x.device)
-        for i, block in enumerate(self.blocks):
-            x = block(
-                x=x,
-                cond_embed=cond_embed,
-                text_state=text_state,
-                text_mask=text_mask,
-                speaker_state=speaker_state,
-                speaker_mask=speaker_mask,
-                caption_state=caption_state,
-                caption_mask=caption_mask,
-                freqs_cis=freqs,
-                self_mask=latent_mask,
-                context_kv=context_kv_cache[i] if context_kv_cache is not None else None,
-            )
+
+        block_kwargs = {
+            "cond_embed": cond_embed,
+            "text_state": text_state,
+            "text_mask": text_mask,
+            "speaker_state": speaker_state,
+            "speaker_mask": speaker_mask,
+            "caption_state": caption_state,
+            "caption_mask": caption_mask,
+            "freqs_cis": freqs,
+            "self_mask": latent_mask,
+        }
+
+        if cache_state is not None:
+            x = self._forward_blocks_cached(x, block_kwargs, context_kv_cache, cache_state)
+        else:
+            for i, block in enumerate(self.blocks):
+                x = block(
+                    x=x,
+                    context_kv=context_kv_cache[i] if context_kv_cache is not None else None,
+                    **block_kwargs,
+                )
 
         x = self.out_norm(x)
         x = self.out_proj(x)
         return x.to(dtype=x_t.dtype)
+
+    def _forward_blocks_cached(
+        self,
+        x: torch.Tensor,
+        block_kwargs: dict,
+        context_kv_cache: list[tuple[torch.Tensor, ...]] | None,
+        cs: object,
+    ) -> torch.Tensor:
+        num_blocks = len(self.blocks)
+        fn = min(cs.fn_blocks, num_blocks)
+        bn = min(cs.bn_blocks, num_blocks - fn)
+
+        def _kv(i: int):
+            return context_kv_cache[i] if context_kv_cache is not None else None
+
+        # Handle batch size change (CFG→non-CFG): slice cached tensors
+        # instead of resetting, so we keep caching through the transition.
+        cur_batch = x.shape[0]
+        if cs.prev_fn_residual is not None and cs.prev_fn_residual.shape[0] != cur_batch:
+            if cs.prev_fn_residual.shape[0] > cur_batch:
+                cs.prev_fn_residual = cs.prev_fn_residual[:cur_batch]
+                if cs.cached_mn_residual is not None:
+                    cs.cached_mn_residual = cs.cached_mn_residual[:cur_batch]
+                # Also slice TaylorSeer internal state
+                if cs.use_taylorseer:
+                    seer = cs._seer
+                    for attr in ("current", "prev", "deriv"):
+                        t = getattr(seer, attr, None)
+                        if t is not None and t.shape[0] > cur_batch:
+                            setattr(seer, attr, t[:cur_batch])
+            else:
+                cs.prev_fn_residual = None
+                cs.cached_mn_residual = None
+                if cs.use_taylorseer:
+                    cs._seer.reset()
+
+        # --- Fn blocks (always run) ---
+        x_before_fn = x
+        for i in range(fn):
+            x = self.blocks[i](x=x, context_kv=_kv(i), **block_kwargs)
+        fn_residual = x - x_before_fn
+
+        # --- Cache decision ---
+        use_cache = False
+        if cs.step >= cs.warmup_steps and cs.prev_fn_residual is not None:
+            # Static schedule overrides dynamic similarity check
+            if cs.steps_mask is not None and cs.step < len(cs.steps_mask):
+                use_cache = cs.steps_mask[cs.step] == 0
+            else:
+                ref_norm = cs.prev_fn_residual.abs().mean()
+                if ref_norm > 0:
+                    diff = (fn_residual - cs.prev_fn_residual).abs().mean() / ref_norm
+                    use_cache = bool(diff < cs.threshold)
+
+        if use_cache and cs.cached_mn_residual is not None:
+            # Cache HIT → skip Mn blocks, apply cached/extrapolated residual
+            if cs.use_taylorseer:
+                approx = cs._seer.approximate(cs.step)
+                if approx is not None:
+                    x = x + approx
+                else:
+                    x = x + cs.cached_mn_residual
+            else:
+                x = x + cs.cached_mn_residual
+            cs.cached_steps.append(cs.step)
+        else:
+            # Cache MISS → run Mn blocks, store residual
+            cs.prev_fn_residual = fn_residual
+            x_before_mn = x
+            for i in range(fn, num_blocks - bn):
+                x = self.blocks[i](x=x, context_kv=_kv(i), **block_kwargs)
+            mn_residual = x - x_before_mn
+            cs.cached_mn_residual = mn_residual
+            if cs.use_taylorseer:
+                cs._seer.update(mn_residual, cs.step)
+
+        # --- Bn blocks (always run) ---
+        for i in range(num_blocks - bn, num_blocks):
+            x = self.blocks[i](x=x, context_kv=_kv(i), **block_kwargs)
+
+        cs.step += 1
+        return x
 
     def forward(
         self,

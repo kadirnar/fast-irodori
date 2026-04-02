@@ -5,13 +5,27 @@
 [![Demo](https://img.shields.io/badge/Demo-HuggingFace%20Space-blue)](https://huggingface.co/spaces/Aratako/Irodori-TTS-500M-v2-Demo)
 [![License: MIT](https://img.shields.io/badge/Code%20License-MIT-green.svg)](LICENSE)
 
-Flow Matching-based Japanese Text-to-Speech model using a Rectified Flow Diffusion Transformer (RF-DiT) over [DACVAE](https://github.com/facebookresearch/dacvae) continuous latents. Based on [Echo-TTS](https://jordandarefsky.com/blog/2025/echo/).
+Flow Matching-based Japanese Text-to-Speech model using a Rectified Flow Diffusion Transformer (RF-DiT) over [DACVAE](https://github.com/kadirnar/fast-dacvae) continuous latents. Based on [Echo-TTS](https://jordandarefsky.com/blog/2025/echo/).
 
 ## Performance
 
-| GPU | TTFT | Generation Time | TTFA | Audio Length | RTF |
-|---|---|---|---|---|---|
-| NVIDIA H100 PCIe | 0.5 ms | 1,648.8 ms | 1,726 ms | ~5.6 s | 0.31x |
+Benchmarked on NVIDIA H100 PCIe, 40 steps, ~18s audio, `--no-ref` mode:
+
+| # | Optimization | TTFT | TTFA | End-to-End | Generation Time | Speedup |
+|---|---|---|---|---|---|---|
+| 0 | **Baseline** (fp32, 40 steps) | 0.7 ms | 1,076 ms | 1,076 ms | 1,074 ms | x1.0 |
+| 1 | + fast-dacvae (conv2d, poly snake, compile decode) | 0.7 ms | 1,056 ms | 1,056 ms | 1,054 ms | x1.0 |
+| 2 | + block cache F1 (cache-dit, skip 11/12 blocks) | 0.6 ms | 224 ms | 224 ms | 223 ms | x4.8 |
+| 3 | + bf16 model precision | 0.5 ms | 153 ms | 153 ms | 152 ms | x7.0 |
+| 4 | + torch.compile (per-block) | 0.4 ms | 141 ms | 141 ms | 140 ms | x7.6 |
+| 5 | + velocity cache (skip=2, 1 forward per 3 steps) | 0.4 ms | 102 ms | 102 ms | 101 ms | x10.5 |
+| 6 | + precomputed cond embeddings + in-place Euler | 0.4 ms | 100 ms | 100 ms | 99 ms | x10.8 |
+| 7 | + bf16 codec decode | 0.4 ms | **86 ms** | **86 ms** | **85 ms** | **x12.5** |
+
+> **TTFT** = Time To First Token (tokenize + prepare reference)
+> **TTFA** = Time To First Audio (total until audio is decoded)
+> **Generation Time** = Sampling + Decode (excludes tokenization overhead)
+> Attention uses FlashAttention-3 (cuDNN backend) automatically via PyTorch SDPA.
 
 ## Installation
 
@@ -49,12 +63,84 @@ uv run irodori-infer \
   --output-wav output.wav
 ```
 
+### Optimized Inference (x12.5 faster)
+
+```bash
+uv run irodori-infer \
+  --hf-checkpoint Aratako/Irodori-TTS-500M-v2 \
+  --text "今日はいい天気ですね。" \
+  --no-ref \
+  --model-precision bf16 \
+  --codec-precision bf16 \
+  --block-cache \
+  --optimize-codec \
+  --output-wav output.wav
+```
+
+### SGLang-Compatible Server
+
+```python
+from irodori_tts.serving.sglang_adapter import launch_server
+
+launch_server(
+    model_path="Aratako/Irodori-TTS-500M-v2",
+    port=8000,
+    optimize=True,
+)
+```
+
+```bash
+# Generate audio via OpenAI-compatible API
+curl -X POST http://localhost:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"input": "今日はいい天気ですね。", "seconds": 20}' \
+  --output output.wav
+
+# Get JSON timings
+curl -X POST http://localhost:8000/v1/audio/speech/json \
+  -H "Content-Type: application/json" \
+  -d '{"input": "今日はいい天気ですね。", "seconds": 20}'
+```
+
+### SGLang Python API (Offline)
+
+```python
+from irodori_tts.serving.sglang_adapter import IrodoriTTSGenerator
+
+gen = IrodoriTTSGenerator.from_pretrained(
+    model_path="Aratako/Irodori-TTS-500M-v2",
+    optimize=True,
+)
+
+result = gen.generate(text="今日はいい天気ですね。", seconds=20.0)
+result.save("output.wav")
+
+print(result.timings)
+# {'ttft_ms': 0.4, 'ttfa_ms': 86.0, 'end_to_end_ms': 86.1,
+#  'generation_time_ms': 85.0, 'sampling_ms': 62.0, 'decode_ms': 23.0,
+#  'audio_duration_s': 18.2}
+
+gen.shutdown()
+```
+
 ### Web UI
 
 ```bash
 uv run irodori-app                # Base model (port 7860)
 uv run irodori-app-voicedesign    # VoiceDesign (port 7861)
 ```
+
+## Optimizations
+
+| Optimization | Source | Effect |
+|---|---|---|
+| **Block Cache** (cache-dit) | [cache-dit](https://github.com/vipshop/cache-dit) | Skip 11/12 DiT blocks per step via residual caching |
+| **Velocity Cache** | Custom | Reuse previous velocity, skip entire forward (1 per 3 steps) |
+| **fast-dacvae** | [fast-dacvae](https://github.com/kadirnar/fast-dacvae) | Conv1d→Conv2d, polynomial Snake, weight-norm strip, torch.compile decode |
+| **torch.compile** | PyTorch | Per-block compilation for kernel fusion |
+| **bf16 precision** | PyTorch | Half-precision model + codec |
+| **Precomputed cond embeddings** | Custom | Batch all timestep embeddings before Euler loop |
+| **FlashAttention-3** | PyTorch SDPA (cuDNN) | Automatic via `F.scaled_dot_product_attention` on H100 |
 
 ## Training
 
@@ -103,9 +189,10 @@ irodori_tts/
   config.py                    # Model / Train / Sampling configs
   model/                       # DiT architecture, RF sampling, LoRA
   text/                        # Tokenizer, text normalization
-  audio/                       # DACVAE codec
+  audio/                       # DACVAE codec (fast-dacvae optimized)
   training/                    # Train loop, dataset, optimizer
   inference/                   # CLI inference, runtime engine
+  serving/                     # SGLang-compatible server + offline API
   app/                         # Gradio web UIs
   tools/                       # Data prep, checkpoint conversion
 configs/                       # YAML training presets
@@ -120,7 +207,9 @@ configs/                       # YAML training presets
 
 - [Irodori-TTS](https://github.com/Aratako/Irodori-TTS) — Original codebase
 - [Echo-TTS](https://jordandarefsky.com/blog/2025/echo/) — Architecture and training design
-- [DACVAE](https://github.com/facebookresearch/dacvae) — Audio VAE
+- [fast-dacvae](https://github.com/kadirnar/fast-dacvae) — Optimized DACVAE codec
+- [cache-dit](https://github.com/vipshop/cache-dit) — Block caching algorithm
+- [SGLang](https://github.com/sgl-project/sglang) — Serving framework
 
 ## Citation
 

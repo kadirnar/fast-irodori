@@ -1,8 +1,90 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 import torch
 
-from irodori_tts.model.dit import TextToLatentRFDiT
+from irodori_tts.model.dit import TextToLatentRFDiT, get_timestep_embedding
+
+
+def _build_steps_mask_ultra(total_steps: int) -> list[int]:
+    """Generate an 'ultra' schedule mask: 1=compute, 0=cache."""
+    if total_steps <= 8:
+        compute_bins, cache_bins = [2, 1, 1], [2, 2]
+    elif total_steps <= 16:
+        compute_bins, cache_bins = [2, 1, 1, 1, 1], [1, 2, 3, 3]
+    elif total_steps <= 28:
+        compute_bins, cache_bins = [4, 1, 1, 1, 1], [2, 5, 6, 7]
+    else:
+        # Scale up for >28 steps
+        ratio = total_steps / 28.0
+        compute_bins = [max(1, int(x * ratio)) for x in [4, 1, 1, 1, 1]]
+        cache_bins = [max(1, int(x * ratio)) for x in [2, 5, 6, 7]]
+    mask: list[int] = []
+    cb, ab = list(reversed(compute_bins)), list(reversed(cache_bins))
+    while len(mask) < total_steps:
+        if cb:
+            mask.extend([1] * cb.pop())
+        if ab:
+            mask.extend([0] * ab.pop())
+    return mask[:total_steps]
+
+
+class _TaylorSeer:
+    """Order-1 Taylor extrapolation for cached residuals."""
+
+    def __init__(self) -> None:
+        self.prev: torch.Tensor | None = None
+        self.current: torch.Tensor | None = None
+        self.deriv: torch.Tensor | None = None
+        self.last_update_step: int = -1
+        self.current_step: int = -1
+
+    def update(self, y: torch.Tensor, step: int) -> None:
+        if self.current is not None and self.current.shape == y.shape:
+            window = max(1, step - self.last_update_step)
+            self.deriv = (y - self.current) / window
+        self.prev = self.current
+        self.current = y
+        self.last_update_step = step
+
+    def approximate(self, step: int) -> torch.Tensor | None:
+        if self.current is None:
+            return None
+        if self.deriv is None:
+            return self.current
+        elapsed = step - self.last_update_step
+        return self.current + self.deriv * elapsed
+
+    def reset(self) -> None:
+        self.prev = self.current = self.deriv = None
+        self.last_update_step = self.current_step = -1
+
+
+@dataclass
+class BlockCacheState:
+    """Runtime state for cache-dit style block caching during Euler sampling."""
+
+    fn_blocks: int = 4
+    bn_blocks: int = 0
+    threshold: float = 0.08
+    warmup_steps: int = 2
+    use_taylorseer: bool = False
+    steps_mask: list[int] | None = None
+    velocity_cache_max_skip: int = 0  # 0=disabled, N=skip up to N steps between forwards
+    # runtime (reset per inference)
+    step: int = 0
+    prev_fn_residual: torch.Tensor | None = None
+    cached_mn_residual: torch.Tensor | None = None
+    cached_steps: list[int] = field(default_factory=list)
+    _seer: _TaylorSeer = field(default_factory=_TaylorSeer)
+
+    def reset(self) -> None:
+        self.step = 0
+        self.prev_fn_residual = None
+        self.cached_mn_residual = None
+        self.cached_steps = []
+        self._seer.reset()
 
 
 def _make_rng(seed: int, device: torch.device) -> tuple[torch.Generator, torch.device]:
@@ -140,6 +222,7 @@ def sample_euler_rf_cfg(
     speaker_kv_scale: float | None = None,
     speaker_kv_max_layers: int | None = None,
     speaker_kv_min_t: float | None = None,
+    block_cache: BlockCacheState | None = None,
 ) -> torch.Tensor:
     """
     Euler sampling over RF ODE with text/reference/caption conditioning CFG.
@@ -414,33 +497,137 @@ def sample_euler_rf_cfg(
             )
     speaker_kv_active = speaker_kv_scale is not None
 
-    for i in range(num_steps):
-        t = t_schedule[i]
-        t_next = t_schedule[i + 1]
-        tt = torch.full((batch_size,), t, device=device, dtype=dtype)
+    # --- Precompute all timestep condition embeddings (batch of num_steps) ---
+    _precomputed_conds: list[torch.Tensor] | None = None
+    if block_cache is not None:
+        all_t_vals = t_schedule[:-1].to(dtype=dtype)  # (num_steps,)
+        all_t_embed = get_timestep_embedding(all_t_vals, model.cfg.timestep_embed_dim).to(
+            dtype=dtype
+        )
+        all_cond = model.cond_module(all_t_embed)  # (num_steps, model_dim*3)
+        _precomputed_conds = [all_cond[j : j + 1, None, :] for j in range(num_steps)]
+        del all_t_embed, all_cond
 
-        use_cfg = bool(enabled_cfg_names) and (cfg_min_t <= t.item() <= cfg_max_t)
-        if use_cfg:
-            if use_independent_cfg:
-                x_t_cfg = torch.cat([x_t] * cfg_batch_mult, dim=0).to(dtype)
-                tt_cfg = tt.repeat(cfg_batch_mult)
-                v_out = model.forward_with_encoded_conditions(
-                    x_t=x_t_cfg,
-                    t=tt_cfg,
-                    text_state=independent_text_state,
-                    text_mask=independent_text_mask,
-                    speaker_state=independent_speaker_state,
-                    speaker_mask=independent_speaker_mask,
-                    caption_state=independent_caption_state,
-                    caption_mask=independent_caption_mask,
-                    context_kv_cache=context_kv_cfg,
-                )
-                chunks = v_out.chunk(cfg_batch_mult, dim=0)
-                v = chunks[0]
-                for name, chunk in zip(independent_names[1:], chunks[1:], strict=True):
-                    v = v + cfg_scales[name] * (chunks[0] - chunk)
+    _vcache_prev_v: torch.Tensor | None = None
+    _vcache_skips: int = 0
+    _use_vcache = (
+        block_cache is not None and block_cache.velocity_cache_max_skip > 0
+    )
+    _vcache_max = block_cache.velocity_cache_max_skip if _use_vcache else 0
+    _vcache_warmup = block_cache.warmup_steps if block_cache is not None else 0
+
+    # Precompute per-step scalars to avoid .item() and Python branching in hot loop
+    _t_floats = [float(t_schedule[j].item()) for j in range(num_steps)]
+    _dt_floats = [float(t_schedule[j + 1].item()) - _t_floats[j] for j in range(num_steps)]
+    _has_cfg = bool(enabled_cfg_names)
+    _use_cfg_flags = [
+        _has_cfg and (cfg_min_t <= _t_floats[j] <= cfg_max_t) for j in range(num_steps)
+    ]
+    # Precompute tt tensors for steps that will actually run forwards
+    _tt_tensors = [
+        torch.full((batch_size,), _t_floats[j], device=device, dtype=dtype)
+        for j in range(num_steps)
+    ]
+
+    for i in range(num_steps):
+        # --- Velocity caching: reuse previous v entirely, skip all forwards ---
+        if (
+            _use_vcache
+            and _vcache_prev_v is not None
+            and _vcache_skips < _vcache_max
+            and i >= _vcache_warmup
+        ):
+            v = _vcache_prev_v
+            _vcache_skips += 1
+            block_cache.step += 1
+        else:
+            _vcache_skips = 0
+            tt = _tt_tensors[i]
+
+            # Precomputed cond_embed for this step (avoids per-step MLP call)
+            _pc = _precomputed_conds[i] if _precomputed_conds is not None else None
+
+            use_cfg = _use_cfg_flags[i]
+            if use_cfg:
+                if use_independent_cfg:
+                    x_t_cfg = torch.cat([x_t] * cfg_batch_mult, dim=0).to(dtype)
+                    tt_cfg = tt.repeat(cfg_batch_mult)
+                    _pc_cfg = _pc.expand(cfg_batch_mult, -1, -1) if _pc is not None else None
+                    v_out = model.forward_with_encoded_conditions(
+                        x_t=x_t_cfg,
+                        t=tt_cfg,
+                        text_state=independent_text_state,
+                        text_mask=independent_text_mask,
+                        speaker_state=independent_speaker_state,
+                        speaker_mask=independent_speaker_mask,
+                        caption_state=independent_caption_state,
+                        caption_mask=independent_caption_mask,
+                        context_kv_cache=context_kv_cfg,
+                        cache_state=block_cache,
+                        precomputed_cond_embed=_pc_cfg,
+                    )
+                    chunks = v_out.chunk(cfg_batch_mult, dim=0)
+                    v = chunks[0]
+                    for name, chunk in zip(independent_names[1:], chunks[1:], strict=True):
+                        v = v + cfg_scales[name] * (chunks[0] - chunk)
+                else:
+                    v_cond = model.forward_with_encoded_conditions(
+                        x_t=x_t.to(dtype),
+                        t=tt,
+                        text_state=text_state_cond,
+                        text_mask=text_mask_cond,
+                        speaker_state=speaker_state_cond,
+                        speaker_mask=speaker_mask_cond,
+                        caption_state=caption_state_cond,
+                        caption_mask=caption_mask_cond,
+                        context_kv_cache=context_kv_cond,
+                        cache_state=block_cache,
+                        precomputed_cond_embed=_pc,
+                    )
+                    if use_joint_cfg:
+                        if len(enabled_cfg_names) > 1:
+                            joint_scales = [cfg_scales[name] for name in enabled_cfg_names]
+                            if max(joint_scales) - min(joint_scales) > 1e-6:
+                                raise ValueError(
+                                    "cfg_guidance_mode='joint' expects equal enabled guidance scales; "
+                                    "set matching text/speaker/caption scales or use --cfg-scale."
+                                )
+                        joint_scale = cfg_scales[enabled_cfg_names[0]]
+                        v_uncond_joint = model.forward_with_encoded_conditions(
+                            x_t=x_t.to(dtype),
+                            t=tt,
+                            text_state=joint_uncond_bundle[0],
+                            text_mask=joint_uncond_bundle[1],
+                            speaker_state=joint_uncond_bundle[2],
+                            speaker_mask=joint_uncond_bundle[3],
+                            caption_state=joint_uncond_bundle[4],
+                            caption_mask=joint_uncond_bundle[5],
+                            context_kv_cache=context_kv_joint_uncond,
+                            cache_state=block_cache,
+                            precomputed_cond_embed=_pc,
+                        )
+                        v = v_cond + joint_scale * (v_cond - v_uncond_joint)
+                    elif use_alternating_cfg:
+                        alt_name = enabled_cfg_names[i % len(enabled_cfg_names)]
+                        alt_bundle = alternating_bundles[alt_name]
+                        v_uncond_alt = model.forward_with_encoded_conditions(
+                            x_t=x_t.to(dtype),
+                            t=tt,
+                            text_state=alt_bundle[0],
+                            text_mask=alt_bundle[1],
+                            speaker_state=alt_bundle[2],
+                            speaker_mask=alt_bundle[3],
+                            caption_state=alt_bundle[4],
+                            caption_mask=alt_bundle[5],
+                            context_kv_cache=context_kv_alternating.get(alt_name),
+                            cache_state=block_cache,
+                            precomputed_cond_embed=_pc,
+                        )
+                        v = v_cond + cfg_scales[alt_name] * (v_cond - v_uncond_alt)
+                    else:
+                        raise RuntimeError(f"Unexpected cfg_guidance_mode: {cfg_guidance_mode}")
             else:
-                v_cond = model.forward_with_encoded_conditions(
+                v = model.forward_with_encoded_conditions(
                     x_t=x_t.to(dtype),
                     t=tt,
                     text_state=text_state_cond,
@@ -450,63 +637,17 @@ def sample_euler_rf_cfg(
                     caption_state=caption_state_cond,
                     caption_mask=caption_mask_cond,
                     context_kv_cache=context_kv_cond,
+                    cache_state=block_cache,
+                    precomputed_cond_embed=_pc,
                 )
-                if use_joint_cfg:
-                    if len(enabled_cfg_names) > 1:
-                        joint_scales = [cfg_scales[name] for name in enabled_cfg_names]
-                        if max(joint_scales) - min(joint_scales) > 1e-6:
-                            raise ValueError(
-                                "cfg_guidance_mode='joint' expects equal enabled guidance scales; "
-                                "set matching text/speaker/caption scales or use --cfg-scale."
-                            )
-                    joint_scale = cfg_scales[enabled_cfg_names[0]]
-                    v_uncond_joint = model.forward_with_encoded_conditions(
-                        x_t=x_t.to(dtype),
-                        t=tt,
-                        text_state=joint_uncond_bundle[0],
-                        text_mask=joint_uncond_bundle[1],
-                        speaker_state=joint_uncond_bundle[2],
-                        speaker_mask=joint_uncond_bundle[3],
-                        caption_state=joint_uncond_bundle[4],
-                        caption_mask=joint_uncond_bundle[5],
-                        context_kv_cache=context_kv_joint_uncond,
-                    )
-                    v = v_cond + joint_scale * (v_cond - v_uncond_joint)
-                elif use_alternating_cfg:
-                    alt_name = enabled_cfg_names[i % len(enabled_cfg_names)]
-                    alt_bundle = alternating_bundles[alt_name]
-                    v_uncond_alt = model.forward_with_encoded_conditions(
-                        x_t=x_t.to(dtype),
-                        t=tt,
-                        text_state=alt_bundle[0],
-                        text_mask=alt_bundle[1],
-                        speaker_state=alt_bundle[2],
-                        speaker_mask=alt_bundle[3],
-                        caption_state=alt_bundle[4],
-                        caption_mask=alt_bundle[5],
-                        context_kv_cache=context_kv_alternating.get(alt_name),
-                    )
-                    v = v_cond + cfg_scales[alt_name] * (v_cond - v_uncond_alt)
-                else:
-                    raise RuntimeError(f"Unexpected cfg_guidance_mode: {cfg_guidance_mode}")
-        else:
-            v = model.forward_with_encoded_conditions(
-                x_t=x_t.to(dtype),
-                t=tt,
-                text_state=text_state_cond,
-                text_mask=text_mask_cond,
-                speaker_state=speaker_state_cond,
-                speaker_mask=speaker_mask_cond,
-                caption_state=caption_state_cond,
-                caption_mask=caption_mask_cond,
-                context_kv_cache=context_kv_cond,
-            )
+
+            _vcache_prev_v = v
 
         if rescale_k is not None and rescale_sigma is not None:
             v = temporal_score_rescale(
                 v_pred=v,
                 x_t=x_t,
-                t=t,
+                t=_t_floats[i],
                 rescale_k=float(rescale_k),
                 rescale_sigma=float(rescale_sigma),
             )
@@ -514,8 +655,8 @@ def sample_euler_rf_cfg(
         if (
             speaker_kv_active
             and speaker_kv_min_t is not None
-            and (t_next < speaker_kv_min_t)
-            and (t >= speaker_kv_min_t)
+            and (_t_floats[i] + _dt_floats[i] < speaker_kv_min_t)
+            and (_t_floats[i] >= speaker_kv_min_t)
         ):
             inv_scale = 1.0 / float(speaker_kv_scale)
             scale_speaker_kv_cache(
@@ -537,6 +678,6 @@ def sample_euler_rf_cfg(
                 )
             speaker_kv_active = False
 
-        x_t = x_t + v * (t_next - t)
+        x_t = x_t.add_(v, alpha=_dt_floats[i])
 
     return x_t

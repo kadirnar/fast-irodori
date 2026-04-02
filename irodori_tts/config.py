@@ -186,6 +186,12 @@ class SamplingConfig:
     speaker_kv_scale: float | None = None
     speaker_kv_min_t: float | None = 0.9
     speaker_kv_max_layers: int | None = None
+    # Block caching (cache-dit): skip middle DiT blocks when adjacent steps are similar.
+    block_cache_enabled: bool = False
+    block_cache_fn: int = 4
+    block_cache_bn: int = 0
+    block_cache_threshold: float = 0.08
+    block_cache_warmup: int = 2
     # Deprecated: inference length is derived from --seconds and codec hop_length.
     sequence_length: int | None = None
     seed: int = 0

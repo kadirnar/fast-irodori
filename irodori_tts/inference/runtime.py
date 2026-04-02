@@ -19,7 +19,7 @@ from irodori_tts.audio.codec import DACVAECodec, patchify_latent, unpatchify_lat
 from irodori_tts.config import ModelConfig
 from irodori_tts.model.dit import TextToLatentRFDiT
 from irodori_tts.model.lora import checkpoint_state_uses_lora
-from irodori_tts.model.rf import sample_euler_rf_cfg
+from irodori_tts.model.rf import BlockCacheState, _build_steps_mask_ultra, sample_euler_rf_cfg
 from irodori_tts.text.normalization import normalize_text
 from irodori_tts.text.tokenizer import PretrainedTextTokenizer
 
@@ -65,7 +65,7 @@ def default_runtime_device() -> str:
 def list_available_runtime_precisions(device: str | torch.device) -> list[str]:
     resolved = resolve_runtime_device(device)
     if resolved.type == "cuda":
-        return ["fp32", "bf16"]
+        return ["fp32", "bf16", "fp16"]
     return ["fp32"]
 
 
@@ -161,6 +161,8 @@ class RuntimeKey:
     enable_watermark: bool = False
     compile_model: bool = False
     compile_dynamic: bool = False
+    compile_blocks: bool = False
+    optimize_codec: bool = False
 
 
 @dataclass
@@ -198,6 +200,14 @@ class SamplingRequest:
     tail_window_size: int = 20
     tail_std_threshold: float = 0.05
     tail_mean_threshold: float = 0.1
+    block_cache_enabled: bool = False
+    block_cache_fn: int = 4
+    block_cache_bn: int = 0
+    block_cache_threshold: float = 0.08
+    block_cache_warmup: int = 2
+    block_cache_taylorseer: bool = False
+    block_cache_schedule: str | None = None  # "ultra" or None
+    block_cache_velocity_skip: int = 0  # 0=disabled, N=skip up to N steps
 
 
 @dataclass
@@ -216,6 +226,7 @@ def _maybe_compile_inference_model(
     *,
     enabled: bool,
     dynamic: bool,
+    block_cache_enabled: bool = False,
 ) -> TextToLatentRFDiT:
     if not enabled:
         return model
@@ -224,10 +235,16 @@ def _maybe_compile_inference_model(
     compile_kwargs = {"dynamic": bool(dynamic)}
     model.encode_conditions = torch.compile(model.encode_conditions, **compile_kwargs)
     model.build_context_kv_cache = torch.compile(model.build_context_kv_cache, **compile_kwargs)
-    model.forward_with_encoded_conditions = torch.compile(
-        model.forward_with_encoded_conditions,
-        **compile_kwargs,
-    )
+    if block_cache_enabled:
+        # Compile individual DiffusionBlocks instead of the top-level forward
+        # to avoid graph breaks from cache control flow.
+        for i, block in enumerate(model.blocks):
+            model.blocks[i] = torch.compile(block, **compile_kwargs)
+    else:
+        model.forward_with_encoded_conditions = torch.compile(
+            model.forward_with_encoded_conditions,
+            **compile_kwargs,
+        )
     return model
 
 
@@ -239,7 +256,11 @@ def resolve_runtime_dtype(*, precision: str, device: torch.device) -> torch.dtyp
         if device.type != "cuda":
             raise ValueError("precision='bf16' currently requires CUDA device.")
         return torch.bfloat16
-    raise ValueError(f"Unsupported precision={precision!r}. Expected one of: fp32, bf16.")
+    if mode == "fp16":
+        if device.type != "cuda":
+            raise ValueError("precision='fp16' currently requires CUDA device.")
+        return torch.float16
+    raise ValueError(f"Unsupported precision={precision!r}. Expected one of: fp32, bf16, fp16.")
 
 
 def resolve_cfg_scales(
@@ -441,8 +462,9 @@ class InferenceRuntime:
         model.eval()
         model = _maybe_compile_inference_model(
             model,
-            enabled=bool(key.compile_model),
+            enabled=bool(key.compile_model) or bool(key.compile_blocks),
             dynamic=bool(key.compile_dynamic),
+            block_cache_enabled=bool(key.compile_blocks),
         )
 
         tokenizer = PretrainedTextTokenizer.from_pretrained(
@@ -487,6 +509,7 @@ class InferenceRuntime:
             deterministic_encode=bool(key.codec_deterministic_encode),
             deterministic_decode=bool(key.codec_deterministic_decode),
             enable_watermark=bool(key.enable_watermark),
+            optimize=bool(key.optimize_codec),
         )
         if model_cfg.latent_dim != codec.latent_dim:
             raise ValueError(
@@ -812,6 +835,19 @@ class InferenceRuntime:
                 speaker_kv_scale=speaker_kv_scale,
                 speaker_kv_max_layers=speaker_kv_max_layers,
                 speaker_kv_min_t=speaker_kv_min_t,
+                block_cache=BlockCacheState(
+                    fn_blocks=int(req.block_cache_fn),
+                    bn_blocks=int(req.block_cache_bn),
+                    threshold=float(req.block_cache_threshold),
+                    warmup_steps=int(req.block_cache_warmup),
+                    use_taylorseer=bool(req.block_cache_taylorseer),
+                    steps_mask=_build_steps_mask_ultra(int(req.num_steps))
+                    if req.block_cache_schedule == "ultra"
+                    else None,
+                    velocity_cache_max_skip=int(req.block_cache_velocity_skip),
+                )
+                if req.block_cache_enabled
+                else None,
             )
             stage_sec = _measure_end(self.model_device, t0)
             stage_timings.append(("sample_rf", stage_sec))
