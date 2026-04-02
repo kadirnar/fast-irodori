@@ -22,10 +22,6 @@ Benchmarked on NVIDIA H100 PCIe, 40 steps, ~18s audio, `--no-ref` mode:
 | 6 | + precomputed cond embeddings + in-place Euler | 0.4 ms | 100 ms | 100 ms | 99 ms | x10.8 |
 | 7 | + bf16 codec decode | 0.4 ms | **86 ms** | **86 ms** | **85 ms** | **x12.5** |
 
-> **TTFT** = Time To First Token (tokenize + prepare reference)
-> **TTFA** = Time To First Audio (total until audio is decoded)
-> **Generation Time** = Sampling + Decode (excludes tokenization overhead)
-> Attention uses FlashAttention-3 (cuDNN backend) automatically via PyTorch SDPA.
 
 ## Installation
 
@@ -37,44 +33,47 @@ uv sync
 
 ## Quick Start
 
-### Inference
+### Python API
 
-```bash
-# With reference audio (voice cloning)
-uv run irodori-infer \
-  --hf-checkpoint Aratako/Irodori-TTS-500M-v2 \
-  --text "今日はいい天気ですね。" \
-  --ref-wav path/to/reference.wav \
-  --output-wav output.wav
+```python
+from irodori_tts.inference.infer import infer
 
-# Without reference audio
-uv run irodori-infer \
-  --hf-checkpoint Aratako/Irodori-TTS-500M-v2 \
-  --text "今日はいい天気ですね。" \
-  --no-ref \
-  --output-wav output.wav
+# Basic inference
+infer(
+    text="今日はいい天気ですね。",
+    hf_checkpoint="Aratako/Irodori-TTS-500M-v2",
+    no_ref=True,
+    output_wav="output.wav",
+)
+
+# Optimized inference (x12.5 faster)
+infer(
+    text="今日はいい天気ですね。",
+    hf_checkpoint="Aratako/Irodori-TTS-500M-v2",
+    no_ref=True,
+    model_precision="bf16",
+    codec_precision="bf16",
+    block_cache=True,
+    optimize_codec=True,
+    output_wav="output.wav",
+)
 
 # VoiceDesign (caption-conditioned)
-uv run irodori-infer \
-  --hf-checkpoint Aratako/Irodori-TTS-500M-v2-VoiceDesign \
-  --text "今日はいい天気ですね。" \
-  --caption "落ち着いた女性の声で、やわらかく自然に読み上げてください。" \
-  --no-ref \
-  --output-wav output.wav
-```
+infer(
+    text="今日はいい天気ですね。",
+    hf_checkpoint="Aratako/Irodori-TTS-500M-v2-VoiceDesign",
+    caption="落ち着いた女性の声で、やわらかく自然に読み上げてください。",
+    no_ref=True,
+    output_wav="output.wav",
+)
 
-### Optimized Inference (x12.5 faster)
-
-```bash
-uv run irodori-infer \
-  --hf-checkpoint Aratako/Irodori-TTS-500M-v2 \
-  --text "今日はいい天気ですね。" \
-  --no-ref \
-  --model-precision bf16 \
-  --codec-precision bf16 \
-  --block-cache \
-  --optimize-codec \
-  --output-wav output.wav
+# With reference audio (voice cloning)
+infer(
+    text="今日はいい天気ですね。",
+    hf_checkpoint="Aratako/Irodori-TTS-500M-v2",
+    ref_wav="path/to/reference.wav",
+    output_wav="output.wav",
+)
 ```
 
 ### SGLang-Compatible Server
@@ -121,6 +120,26 @@ print(result.timings)
 #  'audio_duration_s': 18.2}
 
 gen.shutdown()
+```
+
+### Benchmark
+
+```python
+from benchmark import run_benchmark
+
+# Baseline
+run_benchmark()
+
+# All optimizations
+run_benchmark(
+    optimize_codec=True,
+    model_precision="bf16",
+    codec_precision="bf16",
+    compile_blocks=True,
+    block_cache=True,
+    block_cache_fn=1,
+    block_cache_velocity_skip=2,
+)
 ```
 
 ### Web UI
